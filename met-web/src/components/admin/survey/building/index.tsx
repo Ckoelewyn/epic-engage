@@ -415,7 +415,7 @@ const SurveyFormBuilder = () => {
                         componentsProps={{
                             tooltip: {
                                 sx: {
-                                    bgcolor: '#003366',
+                                    bgcolor: Palette.primary.main,
                                     color: 'white',
                                 },
                             },
@@ -453,7 +453,7 @@ const SurveyFormBuilder = () => {
                         componentsProps={{
                             tooltip: {
                                 sx: {
-                                    bgcolor: '#003366',
+                                    bgcolor: Palette.primary.main,
                                     color: 'white',
                                 },
                             },
