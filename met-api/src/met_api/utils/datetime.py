@@ -14,14 +14,24 @@
 """Datetime object helper."""
 from datetime import datetime
 
-from flask import current_app
+from flask import current_app, has_app_context
 import pytz
+
+DEFAULT_LEGISLATIVE_TIMEZONE = 'America/Vancouver'
+
+
+def legislative_timezone():
+    """Get the tzinfo for BC legislative (Pacific) time."""
+    tz_name = DEFAULT_LEGISLATIVE_TIMEZONE
+    if has_app_context():
+        tz_name = current_app.config.get('LEGISLATIVE_TIMEZONE', DEFAULT_LEGISLATIVE_TIMEZONE)
+    return pytz.timezone(tz_name)
 
 
 def local_datetime():
-    """Get the local (Pacific Timezone) datetime."""
+    """Get the local (BC Pacific Timezone) datetime."""
     utcmoment = datetime.utcnow().replace(tzinfo=pytz.utc)
-    now = utcmoment.astimezone(pytz.timezone('US/Pacific'))
+    now = utcmoment.astimezone(legislative_timezone())
     return now
 
 
@@ -34,8 +44,7 @@ def utc_datetime():
 
 def convert_and_format_to_utc_str(date_val: datetime, dt_format='%Y-%m-%d %H:%M:%S', timezone_override=None):
     """Convert a datetime object to UTC and format it as a string."""
-    tz_name = timezone_override or current_app.config['LEGISLATIVE_TIMEZONE']
-    tz_local = pytz.timezone(tz_name)
+    tz_local = pytz.timezone(timezone_override) if timezone_override else legislative_timezone()
 
     # Assume the input datetime is in the local time zone
     date_val = tz_local.localize(date_val)
