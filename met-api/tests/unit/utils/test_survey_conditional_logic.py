@@ -632,3 +632,190 @@ def test_non_wizard_flat_form_is_supported():
     links = extract_conditional_links(form_json)
 
     assert links['followup1']['trigger_key'] == 'simplesurvey1'
+
+
+def test_visual_builder_radio_equality_with_data_prefix():
+    """The exact jsonLogic the Visual Builder writes for "radio equals X".
+
+    Regression: it roots the field at `data.` and compares with `==`, neither of which the
+    walker read, so the follow-up was left unlinked and rendered as its own top-level question
+    on the report settings tab.
+    """
+    radio = {
+        'key': 'simpleradios',
+        'type': 'simpleradios',
+        'label': 'Radio Button',
+        'values': [{'value': 'thisOne', 'label': 'this one'}, {'value': 'noThisOne', 'label': 'no, this one'}],
+    }
+    followup = _followup_component(
+        'followup1',
+        conditional={'json': {'and': [{'==': [{'var': 'data.simpleradios'}, 'thisOne']}]}},
+    )
+    followup['type'] = 'simpletextfield'
+
+    assert extract_conditional_links(_wizard_form(radio, followup)) == {
+        'followup1': {
+            'trigger_key': 'simpleradios',
+            'trigger_label': 'Radio Button',
+            'row_key': None,
+            'row_label': None,
+            'trigger_values': ['thisOne'],
+            'trigger_value_labels': ['this one'],
+            'follow_up_label': 'Tell us more',
+        },
+    }
+
+
+def test_visual_builder_likert_row_with_data_prefix():
+    """A Likert row's `in` condition, as the Visual Builder writes it."""
+    likert = _likert_component()
+    followup = _followup_component(
+        'followup1',
+        conditional={
+            'json': {'and': [{'in': [{'var': 'data.simplesurvey1.rowA'}, ['disagree', 'stronglyDisagree']]}]},
+        },
+    )
+    links = extract_conditional_links(_wizard_form(likert, followup))
+
+    assert links['followup1']['trigger_key'] == 'simplesurvey1'
+    assert links['followup1']['row_key'] == 'rowA'
+    assert links['followup1']['row_label'] == 'Row A label'
+    assert links['followup1']['trigger_value_labels'] == ['Disagree', 'Strongly Disagree']
+
+
+def test_visual_builder_ranking_collapses_duplicated_rank_values():
+    """Ranking `in` lists carry each rank as both string and number, since jsonLogic's `in` is strict."""
+    ranking = _ranking_component()
+    followup = _followup_component(
+        'followup1',
+        conditional={
+            'json': {
+                'some': [
+                    {'var': 'data.simpleranking1'},
+                    {
+                        'and': [
+                            {'===': [{'var': 'statementId'}, 'stmt2']},
+                            {'in': [{'var': 'rank'}, ['1', '2', 1, 2]]},
+                        ],
+                    },
+                ],
+            },
+        },
+    )
+    links = extract_conditional_links(_wizard_form(ranking, followup))
+
+    assert links['followup1']['trigger_key'] == 'simpleranking1'
+    assert links['followup1']['row_key'] == 'stmt2'
+    # '1' and 1 are the same rank written twice, and must not be shown to an author as two.
+    assert links['followup1']['trigger_values'] == ['1', '2']
+
+
+def test_visual_builder_checkbox_option_checked():
+    """A checkbox option is addressed directly and tested for the boolean it stores."""
+    checkbox = _checkbox_component()
+    followup = _followup_component(
+        'followup1',
+        conditional={'json': {'and': [{'==': [{'var': 'data.simplecheckboxes1.airQuality'}, True]}]}},
+    )
+    links = extract_conditional_links(_wizard_form(checkbox, followup))
+
+    assert links['followup1']['trigger_key'] == 'simplecheckboxes1'
+    assert links['followup1']['row_key'] == 'airQuality'
+    assert links['followup1']['row_label'] == 'Air quality'
+    assert links['followup1']['trigger_value_labels'] == ['Selected']
+
+
+def test_visual_builder_checkbox_option_unchecked_is_dropped():
+    """An unchecked box names no answer a follow-up can be grouped under."""
+    checkbox = _checkbox_component()
+    followup = _followup_component(
+        'followup1',
+        conditional={'json': {'and': [{'==': [{'var': 'data.simplecheckboxes1.airQuality'}, False]}]}},
+    )
+
+    assert not extract_conditional_links(_wizard_form(checkbox, followup))
+
+
+def test_visual_builder_or_group_collects_every_accepted_answer():
+    """Two rules OR'd together are two answers that each trigger the same follow-up."""
+    radio = {
+        'key': 'simpleradios1',
+        'type': 'simpleradios',
+        'label': 'How did you hear about us?',
+        'values': [{'value': 'other', 'label': 'Other'}, {'value': 'friend', 'label': 'A friend'}],
+    }
+    followup = _followup_component(
+        'followup1',
+        conditional={
+            'json': {
+                'or': [
+                    {'==': [{'var': 'data.simpleradios1'}, 'other']},
+                    {'==': [{'var': 'data.simpleradios1'}, 'friend']},
+                ],
+            },
+        },
+    )
+    links = extract_conditional_links(_wizard_form(radio, followup))
+
+    assert links['followup1']['trigger_values'] == ['other', 'friend']
+    assert links['followup1']['trigger_value_labels'] == ['Other', 'A friend']
+
+
+def test_visual_builder_is_empty_check_is_dropped():
+    """An emptiness check is a membership test against [null, ''] - not an answer to group on."""
+    radio = {
+        'key': 'simpleradios1',
+        'type': 'simpleradios',
+        'label': 'How did you hear about us?',
+        'values': [{'value': 'other', 'label': 'Other'}],
+    }
+    followup = _followup_component(
+        'followup1',
+        conditional={'json': {'and': [{'in': [{'var': 'data.simpleradios1'}, [None, '']]}]}},
+    )
+
+    assert not extract_conditional_links(_wizard_form(radio, followup))
+
+
+def test_visual_builder_negated_conditions_are_dropped():
+    """The "not one of" / "not empty" operators wrap in `!`, and name no enumerable answer set."""
+    likert = _likert_component()
+    for negated in (
+        {'!': {'in': [{'var': 'data.simplesurvey1.rowA'}, ['agree']]}},
+        {'!': {'in': [{'var': 'data.simplesurvey1.rowA'}, [None, '']]}},
+    ):
+        followup = _followup_component('followup1', conditional={'json': {'and': [negated]}})
+        assert not extract_conditional_links(_wizard_form(likert, followup)), negated
+
+
+def test_visual_builder_not_equal_is_dropped():
+    """`!=` names the answers the follow-up is *not* shown for."""
+    radio = {
+        'key': 'simpleradios1',
+        'type': 'simpleradios',
+        'label': 'How did you hear about us?',
+        'values': [{'value': 'other', 'label': 'Other'}],
+    }
+    followup = _followup_component(
+        'followup1',
+        conditional={'json': {'and': [{'!=': [{'var': 'data.simpleradios1'}, 'other']}]}},
+    )
+
+    assert not extract_conditional_links(_wizard_form(radio, followup))
+
+
+def test_json_logic_without_the_data_prefix_still_reads():
+    """Conditions authored before the Visual Builder rooted paths at `data.` must keep working."""
+    radio = {
+        'key': 'simpleradios1',
+        'type': 'simpleradios',
+        'label': 'How did you hear about us?',
+        'values': [{'value': 'other', 'label': 'Other'}],
+    }
+    followup = _followup_component(
+        'followup1',
+        conditional={'json': {'==': [{'var': 'simpleradios1'}, 'other']}},
+    )
+    links = extract_conditional_links(_wizard_form(radio, followup))
+
+    assert links['followup1']['trigger_values'] == ['other']

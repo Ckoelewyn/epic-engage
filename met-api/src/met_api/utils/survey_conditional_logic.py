@@ -25,6 +25,11 @@ submitted value is an object of booleans keyed by option (`{optionKey: bool}`), 
 hangs off one *option* of the checkbox the way another hangs off one row of a Likert. The option
 is therefore recorded as the link's row, and the value only ever says the box was ticked.
 
+The Visual Builder (met-formio's ConditionBuilder, which owns ``conditional.json``) roots every
+field reference at ``data.`` - form.io evaluates the tree as ``jsonLogic.apply(json, {data, row,
+form, _})``, so a bare name would not resolve. The prefix is stripped here before a var path is
+read as a component key, and paths written before it was introduced are still accepted.
+
 Form.io resolves a component's visibility from whichever of these is populated, in this
 precedence order: the Advanced JavaScript conditional (``customConditional``) or the Advanced
 Conditional / JSON Logic builder (``conditional.json``) - whichever has content wins over the
@@ -53,6 +58,14 @@ FOLLOW_UP_TYPES = {'simpletextarea', 'simpletextfield'}
 # membership-triggered link can carry - the option itself is named by the row label.
 CHECKED_VALUE = 'true'
 CHECKED_LABEL = 'Selected'
+
+# jsonLogic is applied against `{data, row, form, _}`, so the Visual Builder roots every field
+# reference at `data.` - `data.simpleradios1`, or `data.simplesurvey1.rowA` for a sub-field.
+DATA_PREFIX = 'data.'
+
+# Names that are scoped to the row inside a ranking `some` rather than to a component: they are
+# resolved from the enclosing scope, so an equality check on one names no trigger of its own.
+SCOPE_LOCAL_VARS = {'statementId', 'rank'}
 
 # Matches `data.<key>.<rowKey> === '<value>'` (matrix row) or the flatter `data.<key> === '<value>'`
 # (plain radio/select) inside a customConditional JS expression, `!==` included so it can be
@@ -169,6 +182,54 @@ def _triggers_from_simple_conditional(conditional: dict) -> list:
     return [(trigger_key, row_key or None, str(eq).lower() if isinstance(eq, bool) else str(eq))]
 
 
+def _strip_data_prefix(var_path: str) -> str:
+    """Drop the `data.` root the Visual Builder writes, leaving the component key/sub-field path.
+
+    Left as-is when absent, so a condition authored before the prefix was introduced still reads.
+    """
+    return var_path[len(DATA_PREFIX):] if var_path.startswith(DATA_PREFIX) else var_path
+
+
+def _var_path(node) -> str:
+    """Read a jsonLogic `{"var": "<path>"}` operand as a prefix-free path, or '' if it isn't one."""
+    var_path = node.get('var') if isinstance(node, dict) else None
+    return _strip_data_prefix(var_path) if isinstance(var_path, str) and var_path else ''
+
+
+def _normalize_trigger_value(value):
+    """Render a compared value as the string the submitted answer is recorded as, or None to drop.
+
+    A ticked checkbox reports its own boolean, so `true` becomes the "selected" marker; `false`
+    says the box is *un*ticked, which names no answer to group a follow-up under. Ranking's `in`
+    lists carry both '1' and 1 (jsonLogic's `in` is strict), which collapse to one value here.
+    """
+    if isinstance(value, bool):
+        return CHECKED_VALUE if value else None
+    if value is None or not isinstance(value, (str, int, float)):
+        return None
+    value = str(value)
+    return value or None
+
+
+def _collect_equality_triggers(eq_args, out):
+    """Handle a jsonLogic `{"==": [<var>, <value>]}` node, appending any resolved trigger.
+
+    This is what the Visual Builder writes for the "equals" operator - the shape behind a plain
+    radio/select follow-up, and behind a checkbox option tested for `true`.
+    """
+    if not (isinstance(eq_args, list) and len(eq_args) == 2):
+        return
+    var_node, value_node = eq_args
+    var_path = _var_path(var_node)
+    if not var_path or var_path in SCOPE_LOCAL_VARS:
+        return
+    value = _normalize_trigger_value(value_node)
+    if value is None:
+        return
+    trigger_key, _, row_key = var_path.partition('.')
+    out.append((trigger_key, row_key or None, value))
+
+
 def _triggers_from_json_logic(node, trigger_key=None, row_key=None, out=None) -> list:
     """Recursively walk a conditional.json jsonLogic tree, collecting (trigger_key, row_key, value) triggers.
 
@@ -185,6 +246,8 @@ def _triggers_from_json_logic(node, trigger_key=None, row_key=None, out=None) ->
         return out
 
     _collect_in_triggers(node.get('in'), trigger_key, row_key, out)
+    _collect_equality_triggers(node.get('=='), out)
+    _collect_equality_triggers(node.get('==='), out)
     _walk_some(node.get('some'), row_key, out)
     _walk_and(node.get('and'), trigger_key, row_key, out)
     _walk_or(node.get('or'), trigger_key, row_key, out)
@@ -201,14 +264,17 @@ def _collect_in_triggers(in_args, trigger_key, row_key, out):
     # `{"in": ["<option>", {"var": "<key>"}]}` - operands swap round when the answer itself is the
     # collection being searched (a multi-select dropdown), so the option is the needle.
     if isinstance(var_node, str) and isinstance(values_node, dict):
-        haystack = values_node.get('var')
-        if isinstance(haystack, str) and haystack:
+        haystack = _var_path(values_node)
+        if haystack:
             out.append((haystack, var_node, CHECKED_VALUE))
         return
 
-    values = values_node if isinstance(values_node, list) else []
-    var_path = var_node.get('var') if isinstance(var_node, dict) else None
-    if not isinstance(var_path, str) or not var_path:
+    # An "is empty" condition is written as a membership test against `[null, '']`; both operands
+    # drop out here, leaving nothing, since emptiness names no answer to group a follow-up under.
+    raw_values = values_node if isinstance(values_node, list) else []
+    values = [value for value in map(_normalize_trigger_value, raw_values) if value is not None]
+    var_path = _var_path(var_node)
+    if not var_path:
         return
 
     if '.' in var_path:
@@ -228,7 +294,7 @@ def _walk_some(some_args, row_key, out):
     if not (isinstance(some_args, list) and len(some_args) == 2):
         return
     scope_node, predicate_node = some_args
-    scope_key = scope_node.get('var') if isinstance(scope_node, dict) else None
+    scope_key = _var_path(scope_node) or None
     _triggers_from_json_logic(predicate_node, trigger_key=scope_key, row_key=row_key, out=out)
 
 
@@ -301,7 +367,9 @@ def _resolve_link(triggers: list, row_labels: dict, simple_trigger_keys: set, co
                 continue
         elif trigger_key not in simple_trigger_keys:
             continue
-        by_trigger.setdefault((trigger_key, row_key), []).append(value)
+        values = by_trigger.setdefault((trigger_key, row_key), [])
+        if value not in values:
+            values.append(value)
 
     if not by_trigger:
         return None
